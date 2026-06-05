@@ -2,6 +2,6 @@ mss>=9.0.1
 keyboard>=0.13.5
 requests>=2.31.0
 Pillow>=10.0.0
-openai>=1.0.0
+python-dotenv>=1.0.1
 mistralai>=1.0.0
-python-dotenv
+openai>=1.0.0
