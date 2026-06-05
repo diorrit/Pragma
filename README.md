@@ -85,14 +85,12 @@ stop.bat
 2. Розділ **API Keys** → **Create new key**
 3. Скопіюй ключ у `MISTRAL_API_KEY`
 
-> Є безкоштовний тир без прив'язки карти.
 
 ### OpenRouter API Key (`OPENROUTER_API_KEY`) — для Gemini
 
 1. Зареєструйся на [openrouter.ai](https://openrouter.ai/keys)
 2. Створи ключ, скопіюй у `OPENROUTER_API_KEY`
 
-> Потрібен лише якщо плануєш використовувати режим Gemini.
 
 ---
 
@@ -201,14 +199,14 @@ HOTKEY=alt+f9
 
 - **Витягує питання**: Pixtral-12b (vision)
 - **Вирішує**: Mistral Large Latest
-- **Відповідь**: коротка, 1–2 речення
+- **Відповідь**: докладно, крок за кроком
 - **Ключ**: `MISTRAL_API_KEY`
 
 ### ✨ Gemini
 
 - **Витягує питання**: Gemini 2.5 Flash (через OpenRouter)
-- **Вирішує**: Gemini 2.5 Flash — докладно, крок за кроком
-- **Стискає**: Mistral Large до одного рядка перед відправкою
+- **Вирішує**: Gemini 2.5 Flash
+- **Стискає**: коротка, 1–2 речення, може й пару слів
 - **Ключ**: `OPENROUTER_API_KEY`
 
 ### Автоматичний fallback
