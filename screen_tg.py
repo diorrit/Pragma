@@ -35,7 +35,13 @@ SOLVER_MODEL        = os.getenv("SOLVER_MODEL", "mistral-large-latest")
 
 PROVIDER_ORDER = ["mistral", "gemini"]
 _stop = threading.Event()
-_thinking_msg_id = None   # message_id повідомлення "Думаю...", щоб видалити його після відповіді
+
+# ─── Стан поточного завдання ─────────────────────────────────────────────────
+_thinking_msg_id = None              # message_id повідомлення "Думаю..."
+_cancel_event    = threading.Event() # встановлюється при натисканні ⏹ Скасувати
+_task_queue: queue.Queue = queue.Queue()  # черга завдань
+_task_lock       = threading.Lock()  # захист _thinking_msg_id
+_worker_running  = False             # чи зараз виконується воркер
 
 # ─── Клієнти ──────────────────────────────────────────────────────────────────
 
@@ -635,11 +641,16 @@ def _call_with_fallback(fn_map, *args):
         if fn is None:
             provider = _next_provider(provider)
             continue
+        # Перевіряємо скасування перед кожним викликом AI
+        if _cancel_event.is_set():
+            raise Exception("__cancelled__")
         try:
             result = fn(*args)
             AI_PROVIDER = provider
             return result, provider
         except Exception as e:
+            if str(e) == "__cancelled__":
+                raise
             if _is_quota_error(e):
                 next_p = _next_provider(provider)
                 if next_p:
@@ -652,48 +663,100 @@ def _call_with_fallback(fn_map, *args):
                 raise
     raise Exception("❌ Не вдалося викликати жодного провайдера.")
 
-# ─── Вивід ────────────────────────────────────────────────────────────────────
+# ─── Вивід ───────────────────────────────────────────────────────────────────
 
 def _notify(text: str):
+    """Надсилає "Думаю..." з кнопкою ⏹, зберігає його ID."""
     global _thinking_msg_id
-    msg_id = send_message(text)
-    # Зберігаємо ID повідомлення "Думаю...", щоб потім видалити
-    if "Думаю" in text:
-        _thinking_msg_id = msg_id
+    msg_id = send_with_cancel_button(text)
+    with _task_lock:
+        if "Думаю" in text:
+            _thinking_msg_id = msg_id
     if OUTPUT_MODE == "overlay":
         overlay_show(text, duration=6)
 
 def _deliver_answer(text: str, provider: str):
+    """Редагує повідомлення "Думаю..." → готова відповідь (без кнопки скасування)."""
     global _thinking_msg_id
-    # Видаляємо повідомлення "Думаю..." перед надсиланням відповіді
-    if _thinking_msg_id is not None:
-        delete_message(_thinking_msg_id)
-        _thinking_msg_id = None
     emoji = {"mistral": "⚡", "gemini": "✨"}.get(provider, "🤖")
-    send_message(f"{emoji} [{provider.upper()}]\n{text}")
+    full  = f"{emoji} [{provider.upper()}]\n{text}"
+    with _task_lock:
+        mid = _thinking_msg_id
+        _thinking_msg_id = None
+    if mid:
+        edit_message(mid, full)
+    else:
+        send_message(full)
     if OUTPUT_MODE == "overlay":
         overlay_show(f"{emoji} {text}", duration=12)
 
-# ─── Telegram ─────────────────────────────────────────────────────────────────
+# ─── Telegram API ────────────────────────────────────────────────────────────
 
-def _tg_post(method, **kwargs):
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", timeout=30, **kwargs)
-        return r.json()
-    except Exception:
-        return None
+_RETRY_DELAYS = [1, 2, 4]  # секунди між спробами (backoff)
+
+def _tg_post(method, *, retries=3, **kwargs):
+    """POST до Telegram API з retry+backoff при мережевих помилках."""
+    last_err = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS[:retries - 1]):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                timeout=30, **kwargs
+            )
+            data = r.json()
+            if data.get("ok"):
+                return data
+            # Telegram повернув ok=false — не мережева помилка, не повторювати
+            return data
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            if attempt + 1 < retries:
+                continue
+    return None
 
 def delete_message(message_id: int):
-    """Видаляє повідомлення з чату за його ID."""
     _tg_post("deleteMessage", data={"chat_id": CHAT_ID, "message_id": message_id})
 
-def send_message(text: str):
+def edit_message(message_id: int, text: str):
+    """Редагує існуюче повідомлення (без кнопок)."""
+    _tg_post("editMessageText", json={
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+    })
+
+def send_message(text: str) -> int | None:
     """Надсилає повідомлення і повертає message_id (або None)."""
-    resp = _tg_post("sendMessage", data={"chat_id": CHAT_ID, "text": text})
+    resp = _tg_post("sendMessage", json={"chat_id": CHAT_ID, "text": text})
     try:
         return resp["result"]["message_id"]
     except Exception:
         return None
+
+def send_with_cancel_button(text: str) -> int | None:
+    """Надсилає повідомлення з кнопкою ⏹ Скасувати (inline keyboard)."""
+    resp = _tg_post("sendMessage", json={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "⏹ Скасувати", "callback_data": "cancel_task"}
+            ]]
+        },
+    })
+    try:
+        return resp["result"]["message_id"]
+    except Exception:
+        return None
+
+def answer_callback(callback_query_id: str, text: str = ""):
+    """Відповідає на callback щоб прибрати годинник у Telegram."""
+    _tg_post("answerCallbackQuery", json={
+        "callback_query_id": callback_query_id,
+        "text": text,
+    })
 
 def send_reply_keyboard(text: str):
     _tg_post("sendMessage", json={
@@ -727,27 +790,65 @@ def _switch_model():
     idx = PROVIDER_ORDER.index(AI_PROVIDER) if AI_PROVIDER in PROVIDER_ORDER else 0
     AI_PROVIDER = PROVIDER_ORDER[(idx + 1) % len(PROVIDER_ORDER)]
 
-# ─── Основна логіка ───────────────────────────────────────────────────────────
+# ─── Черга завдань ───────────────────────────────────────────────────────────
 
-def on_trigger_action():
-    def worker():
-        global _thinking_msg_id
+def _run_task_queue():
+    """Єдиний фоновий потік що обробляє чергу завдань по одному."""
+    global _worker_running, _thinking_msg_id
+    _worker_running = True
+    while True:
         try:
-            _notify(f"📸 [{_provider_emoji(AI_PROVIDER)} {AI_PROVIDER.upper()}] Думаю...")
-            buf = make_screenshot()
-            image_b64 = base64.b64encode(buf.read()).decode()
+            image_b64 = _task_queue.get(timeout=0.3)
+        except queue.Empty:
+            # Якщо черга порожня — потік завершується, наступний тригер запустить новий
+            _worker_running = False
+            return
+
+        _cancel_event.clear()
+        queue_size = _task_queue.qsize()
+        label = f"📸 [{_provider_emoji(AI_PROVIDER)} {AI_PROVIDER.upper()}] Думаю..."
+        if queue_size > 0:
+            label += f"\n📋 Ще в черзі: {queue_size}"
+
+        try:
+            _notify(label)
             question, _ = _call_with_fallback(_EXTRACT_FNS, image_b64)
             answer, p_solve = _call_with_fallback(_SOLVE_FNS, question)
             if p_solve == "gemini" or len(answer) > 400:
                 answer, _ = _call_with_fallback(_COMPRESS_FNS, answer)
             _deliver_answer(answer, p_solve)
         except Exception as e:
-            # Видаляємо "Думаю..." навіть при помилці
-            if _thinking_msg_id is not None:
-                delete_message(_thinking_msg_id)
+            with _task_lock:
+                mid = _thinking_msg_id
                 _thinking_msg_id = None
-            _notify(f"❗ Помилка: {e}")
-    threading.Thread(target=worker, daemon=True).start()
+            if str(e) == "__cancelled__":
+                if mid:
+                    edit_message(mid, "⏹ Скасовано.")
+                else:
+                    send_message("⏹ Скасовано.")
+            else:
+                msg = f"❗ Помилка: {e}"
+                if mid:
+                    edit_message(mid, msg)
+                else:
+                    send_message(msg)
+        finally:
+            _task_queue.task_done()
+
+
+def on_trigger_action():
+    """Робить скриншот і кладе його в чергу завдань."""
+    global _worker_running
+    try:
+        buf = make_screenshot()
+        image_b64 = base64.b64encode(buf.read()).decode()
+        _task_queue.put(image_b64)
+        # Запускаємо воркер тільки якщо він не запущений
+        with _task_lock:
+            if not _worker_running:
+                threading.Thread(target=_run_task_queue, daemon=True).start()
+    except Exception as e:
+        send_message(f"❗ Не вдалося зробити скриншот: {e}")
 
 # ─── Telegram polling ─────────────────────────────────────────────────────────
 
@@ -793,6 +894,24 @@ def telegram_polling_loop():
                 time.sleep(0.2); continue
             for update in data["result"]:
                 offset = update["update_id"] + 1
+
+                # ── Inline-кнопка (⏹ Скасувати) ──
+                cb = update.get("callback_query")
+                if cb and str(cb.get("from", {}).get("id")) == str(CHAT_ID) or \
+                   cb and str(cb.get("message", {}).get("chat", {}).get("id")) == str(CHAT_ID):
+                    if cb.get("data") == "cancel_task":
+                        _cancel_event.set()
+                        # Очищаємо чергу
+                        while not _task_queue.empty():
+                            try:
+                                _task_queue.get_nowait()
+                                _task_queue.task_done()
+                            except queue.Empty:
+                                break
+                        answer_callback(cb["id"], "⏹ Скасовано")
+                    continue
+
+                # ── Звичайне повідомлення ──
                 message = update.get("message")
                 if message and str(message.get("chat", {}).get("id")) == str(CHAT_ID):
                     text = message.get("text", "")
