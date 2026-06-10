@@ -35,6 +35,7 @@ SOLVER_MODEL        = os.getenv("SOLVER_MODEL", "mistral-large-latest")
 
 PROVIDER_ORDER = ["mistral", "gemini"]
 _stop = threading.Event()
+_thinking_msg_id = None   # message_id повідомлення "Думаю...", щоб видалити його після відповіді
 
 # ─── Клієнти ──────────────────────────────────────────────────────────────────
 
@@ -654,11 +655,20 @@ def _call_with_fallback(fn_map, *args):
 # ─── Вивід ────────────────────────────────────────────────────────────────────
 
 def _notify(text: str):
-    send_message(text)
+    global _thinking_msg_id
+    msg_id = send_message(text)
+    # Зберігаємо ID повідомлення "Думаю...", щоб потім видалити
+    if "Думаю" in text:
+        _thinking_msg_id = msg_id
     if OUTPUT_MODE == "overlay":
         overlay_show(text, duration=6)
 
 def _deliver_answer(text: str, provider: str):
+    global _thinking_msg_id
+    # Видаляємо повідомлення "Думаю..." перед надсиланням відповіді
+    if _thinking_msg_id is not None:
+        delete_message(_thinking_msg_id)
+        _thinking_msg_id = None
     emoji = {"mistral": "⚡", "gemini": "✨"}.get(provider, "🤖")
     send_message(f"{emoji} [{provider.upper()}]\n{text}")
     if OUTPUT_MODE == "overlay":
@@ -668,12 +678,22 @@ def _deliver_answer(text: str, provider: str):
 
 def _tg_post(method, **kwargs):
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", timeout=30, **kwargs)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", timeout=30, **kwargs)
+        return r.json()
     except Exception:
-        pass
+        return None
+
+def delete_message(message_id: int):
+    """Видаляє повідомлення з чату за його ID."""
+    _tg_post("deleteMessage", data={"chat_id": CHAT_ID, "message_id": message_id})
 
 def send_message(text: str):
-    _tg_post("sendMessage", data={"chat_id": CHAT_ID, "text": text})
+    """Надсилає повідомлення і повертає message_id (або None)."""
+    resp = _tg_post("sendMessage", data={"chat_id": CHAT_ID, "text": text})
+    try:
+        return resp["result"]["message_id"]
+    except Exception:
+        return None
 
 def send_reply_keyboard(text: str):
     _tg_post("sendMessage", json={
@@ -711,6 +731,7 @@ def _switch_model():
 
 def on_trigger_action():
     def worker():
+        global _thinking_msg_id
         try:
             _notify(f"📸 [{_provider_emoji(AI_PROVIDER)} {AI_PROVIDER.upper()}] Думаю...")
             buf = make_screenshot()
@@ -721,6 +742,10 @@ def on_trigger_action():
                 answer, _ = _call_with_fallback(_COMPRESS_FNS, answer)
             _deliver_answer(answer, p_solve)
         except Exception as e:
+            # Видаляємо "Думаю..." навіть при помилці
+            if _thinking_msg_id is not None:
+                delete_message(_thinking_msg_id)
+                _thinking_msg_id = None
             _notify(f"❗ Помилка: {e}")
     threading.Thread(target=worker, daemon=True).start()
 
