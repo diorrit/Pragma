@@ -876,7 +876,7 @@ def telegram_polling_loop():
     mode_icon = "📱" if OUTPUT_MODE == "telegram" else "🪟"
     _tg_post("sendMessage", json={
         "chat_id": CHAT_ID,
-        "text": f"🤖 Wrata — активна!\n{mode_icon} Режим: {OUTPUT_MODE.upper()}\n\n{_build_status_text(token_status or None)}",
+        "text": f"🤖 Pragma — активна!\n{mode_icon} Режим: {OUTPUT_MODE.upper()}\n\n{_build_status_text(token_status or None)}",
         "reply_markup": {"keyboard": [
             [{"text": "📸 Зробити скрін"}, {"text": "🔄 Змінити модель"}],
             [{"text": "ℹ️ Статус"},        {"text": "❌ Зупинити бот"}],
